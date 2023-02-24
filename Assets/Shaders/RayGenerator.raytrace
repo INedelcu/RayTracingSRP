@@ -1,0 +1,104 @@
+﻿#include "HLSLSupport.cginc"
+#include "UnityShaderVariables.cginc"
+#include "Light.hlsl"
+#include "RayPayload.hlsl"
+#include "Globals.hlsl"
+
+#pragma max_recursion_depth 10
+//#pragma enable_ray_tracing_shader_debug_symbols
+
+// Input
+
+float4x4 								g_InvViewMatrix;
+float4x4 								g_ViewMatrix;
+float                                   g_Zoom;
+TextureCube<float4>                     g_EnvTex;
+SamplerState                            sampler_linear_repeat;
+
+// Output
+RWTexture2D<float4> 					g_Output;
+
+[shader("miss")]
+void MainMissShader1_Primary(inout RayPayload payload : SV_RayPayload)
+{
+	payload.color = g_EnvTex.SampleLevel(sampler_linear_repeat, WorldRayDirection(), 0);
+    payload.worldPos.w = 0;
+}
+
+[shader("miss")]
+void MainMissShader2_Shadow(inout RayPayloadShadow payload : SV_RayPayload)
+{
+    // The ray "hit" the light.
+	payload.shadowValue = 1.0;
+}
+
+[shader("raygeneration")]
+void MainRayGenShader()
+{ 
+	uint2 LaunchIndex = DispatchRaysIndex().xy;
+    uint2 LaunchDim = DispatchRaysDimensions().xy;
+
+    float2 frameCoord = float2(LaunchIndex.x, LaunchDim.y - LaunchIndex.y - 1) + float2(0.5, 0.5);
+
+    const uint subSampleCount = 4;
+    float2 subSamplePos[subSampleCount] = { float2(0.25, 0.25), float2(0.75, 0.25), float2(0.75, 0.75), float2(0.25, 0.75) };
+
+    // The ray origin is the camera position in world space.
+    float3 rayOrigin = float3(g_InvViewMatrix[0][3], g_InvViewMatrix[1][3], g_InvViewMatrix[2][3]);
+
+    float aspectRatio = (float)LaunchDim.x / (float)LaunchDim.y;
+
+    float3 finalColor = float3(0, 0, 0);
+
+    for (uint i = 0; i < subSampleCount; i++)
+    {
+        float2 ndcCoords = (frameCoord + subSamplePos[i]) / float2(LaunchDim.x - 1, LaunchDim.y - 1) ;
+        
+        ndcCoords = ndcCoords * 2 - float2(1, 1);
+        ndcCoords = ndcCoords * g_Zoom;
+
+        float3 viewDirection = normalize(float3(ndcCoords.x * aspectRatio, ndcCoords.y, -1));
+
+        // Rotate the ray from view space to world space.
+        float3 rayDirection = normalize(mul((float3x3)g_InvViewMatrix, viewDirection));
+
+        RayDesc ray;
+        ray.Origin = rayOrigin;
+        ray.Direction = rayDirection;
+        ray.TMin = 0;
+        ray.TMax = 1e10f;
+        
+        RayPayload payload;        
+        payload.color = float4(0, 0, 0, 0);
+        payload.worldPos = float4(0, 0, 0, 1);
+	    payload.bounceIndex = 0;
+    
+        TraceRay(g_SceneAccelStruct, 0, 0xFF, 0, 1, 0, ray, payload);
+
+        float4 color = float4(payload.color.xyz, 1);
+    
+        // Shadow ray
+        float3 vecToLight = PointLightPosition - payload.worldPos.xyz;
+        float vecToLightLength = length(PointLightPosition - payload.worldPos.xyz);
+        float3 vecToLightNorm = normalize(vecToLight);
+
+        RayDesc shadowRay;
+        shadowRay.Origin = payload.worldPos.xyz + vecToLightNorm * 0.001f;
+        shadowRay.Direction = vecToLightNorm;
+        shadowRay.TMin = 0;
+        shadowRay.TMax = vecToLightLength;
+        
+        RayPayloadShadow payloadShadow;
+        payloadShadow.shadowValue = 0.5f;
+    
+        const uint missShaderForShadowRay = 1;
+        TraceRay(g_SceneAccelStruct, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, missShaderForShadowRay, shadowRay, payloadShadow);
+
+        if (payload.worldPos.w == 1)
+            color *= payloadShadow.shadowValue;
+
+        finalColor += color;
+    }
+
+	g_Output[frameCoord] = float4(finalColor / (float)subSampleCount, 1);
+}
