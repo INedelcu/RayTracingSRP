@@ -20,7 +20,7 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
     {
         renderPipelineAsset = asset;
 
-        RayTracingAccelerationStructure.RASSettings settings = new RayTracingAccelerationStructure.RASSettings()
+        RayTracingAccelerationStructure.Settings settings = new RayTracingAccelerationStructure.Settings()
         {
             rayTracingModeMask = RayTracingAccelerationStructure.RayTracingModeMask.Everything,
             managementMode = RayTracingAccelerationStructure.ManagementMode.Manual,
@@ -47,10 +47,16 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
 
         rtHandleSystem.Dispose();
     }
+    class RTASBuildPassData
+    {
+        public RayTracingAccelerationStructureHandle rtasHandleOutput;
+    }
 
     class RayTracingRenderPassData
     {
         public TextureHandle outputTexture;
+
+        public RayTracingAccelerationStructureHandle rtasHandleInput;
     };
 
     protected override void Render (ScriptableRenderContext context, Camera[] cameras)
@@ -126,7 +132,7 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
 
             Light pointLight = null;
 
-            Object[] lights = Object.FindObjectsOfType(typeof(Light));
+            Object[] lights = Object.FindObjectsByType(typeof(Light), FindObjectsSortMode.None);
 
             foreach (Object l in lights)
             {
@@ -141,10 +147,10 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
                 }
             }
 
-            if (pointLight == null)             
-            {
+            if (pointLight == null)
                 return;
-            }
+
+            RTHandle outputRTHandle = rtHandleSystem.Alloc(additionalData.rayTracingOutput, "g_Radiance");
 
             CommandBuffer commandBuffer = new CommandBuffer();
 
@@ -161,27 +167,43 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
                     currentFrameIndex = additionalData.frameIndex
                 };
 
-                RTHandle outputRTHandle = rtHandleSystem.Alloc(additionalData.rayTracingOutput, "g_Output");
-
                 using (renderGraph.RecordAndExecute(renderGraphParams))
                 {
+                    RayTracingAccelerationStructureHandle rtasHandle = renderGraph.ImportRayTracingAccelerationStructure(rtas, "g_AccelStruct");
+
+                    RTASBuildPassData rtasBuildPassData = new RTASBuildPassData();
+
+                    if (buildRTASForCamera)
+                    {
+                        // Build the RTAS only for the first camera in the list, unless we do camera relative ray tracing by specifying a camera position in BuildRayTracingAccelerationStructure.
+                        buildRTASForCamera = false;
+
+                        var passName = renderPipelineAsset.useAsyncRTASBuild ? "RTAS Build Pass (Async Compute)" : "RTAS Build Pass";
+                        using (var builder = renderGraph.AddRenderPass<RTASBuildPassData>(passName, out rtasBuildPassData))
+                        {
+                            builder.EnableAsyncCompute(renderPipelineAsset.useAsyncRTASBuild);
+
+                            rtasBuildPassData.rtasHandleOutput = builder.WriteRayTracingAccelerationStructure(rtasHandle);
+
+                            builder.SetRenderFunc(
+                                (RTASBuildPassData data, RenderGraphContext ctx) =>
+                                {
+                                    ctx.cmd.BuildRayTracingAccelerationStructure(data.rtasHandleOutput);
+                                });
+                        }
+                    }                    
+
                     using (var builder = renderGraph.AddRenderPass<RayTracingRenderPassData>("My RayTracing Pass", out var passData))
                     {
                         TextureHandle output = renderGraph.ImportTexture(outputRTHandle);
 
                         passData.outputTexture = builder.WriteTexture(output);
 
+                        passData.rtasHandleInput = builder.ReadRayTracingAccelerationStructure(rtasBuildPassData.rtasHandleOutput);
+
                         builder.SetRenderFunc(
                             (RayTracingRenderPassData data, RenderGraphContext ctx) =>
                             {
-                                if (buildRTASForCamera)
-                                {
-                                    // Build the RTAS only for one camera.
-                                    buildRTASForCamera = false;
-
-                                    ctx.cmd.BuildRayTracingAccelerationStructure(rtas);
-                                }
-
                                 ctx.cmd.SetRayTracingShaderPass(renderPipelineAsset.rayTracingShader, "Test");
 
                                 // Input
@@ -189,7 +211,7 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
                                 ctx.cmd.SetGlobalVector(Shader.PropertyToID("PointLightColor"), pointLight.color);
                                 ctx.cmd.SetGlobalFloat(Shader.PropertyToID("PointLightRange"), pointLight.range);
                                 ctx.cmd.SetGlobalFloat(Shader.PropertyToID("PointLightIntensity"), pointLight.intensity);
-                                ctx.cmd.SetRayTracingAccelerationStructure(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_SceneAccelStruct"), rtas);
+                                ctx.cmd.SetGlobalRayTracingAccelerationStructure(Shader.PropertyToID("g_SceneAccelStruct"), passData.rtasHandleInput);
 
                                 ctx.cmd.SetRayTracingMatrixParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_InvViewMatrix"), camera.cameraToWorldMatrix);                                
                                 ctx.cmd.SetRayTracingFloatParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_Zoom"), Mathf.Tan(Mathf.Deg2Rad * camera.fieldOfView * 0.5f));
@@ -219,6 +241,8 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
             commandBuffer.Release();
 
             context.Submit();
+
+            rtHandleSystem.Release(outputRTHandle);
 
             renderGraph.EndFrame();
 
