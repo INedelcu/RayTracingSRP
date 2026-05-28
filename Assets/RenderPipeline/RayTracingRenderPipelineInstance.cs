@@ -1,18 +1,18 @@
+using System;
 using System.Collections.Generic;
 
 using UnityEngine;
 using UnityEngine.Rendering;
-using UnityEngine.Experimental.Rendering;
-
-using UnityEngine.Experimental.Rendering.RenderGraphModule;
+using UnityEngine.Rendering.RenderGraphModule;
+using UnityEngine.Rendering.RendererUtils;
 
 public class RayTracingRenderPipelineInstance : RenderPipeline
-{   
+{
     private RayTracingRenderPipelineAsset renderPipelineAsset;
 
     private RayTracingAccelerationStructure rtas = null;
 
-    private RenderGraph renderGraph = null;
+    private UnityEngine.Rendering.RenderGraphModule.RenderGraph renderGraph = null;
 
     private RTHandleSystem rtHandleSystem = null;
 
@@ -20,16 +20,16 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
     {
         renderPipelineAsset = asset;
 
-        RayTracingAccelerationStructure.RASSettings settings = new RayTracingAccelerationStructure.RASSettings()
+        RayTracingAccelerationStructure.Settings settings = new RayTracingAccelerationStructure.Settings()
         {
             rayTracingModeMask = RayTracingAccelerationStructure.RayTracingModeMask.Everything,
             managementMode = RayTracingAccelerationStructure.ManagementMode.Manual,
             layerMask = 255
         };
-      
+
         rtas = new RayTracingAccelerationStructure(settings);
 
-        renderGraph = new RenderGraph("THE Render Graph");
+        renderGraph = new UnityEngine.Rendering.RenderGraphModule.RenderGraph("THE Render Graph");
 
         rtHandleSystem = new RTHandleSystem();
     }
@@ -50,10 +50,10 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
 
     class RayTracingRenderPassData
     {
-        public TextureHandle outputTexture;
+        public UnityEngine.Rendering.RenderGraphModule.TextureHandle outputTexture;
     };
 
-    protected override void Render (ScriptableRenderContext context, Camera[] cameras)
+    protected override void Render (ScriptableRenderContext context, List<Camera> cameras)
     {
         bool error = false;
 
@@ -93,7 +93,7 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
             cullingConfig.subMeshFlagsConfig.transparentMaterials = RayTracingSubMeshFlags.Disabled;
 
             // Enable anyhit shaders for alpha-tested / cutout geometries.
-            cullingConfig.subMeshFlagsConfig.alphaTestedMaterials = RayTracingSubMeshFlags.Enabled;        
+            cullingConfig.subMeshFlagsConfig.alphaTestedMaterials = RayTracingSubMeshFlags.Enabled;
 
             List<RayTracingInstanceCullingTest> instanceTests = new List<RayTracingInstanceCullingTest>();
 
@@ -112,7 +112,9 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
             rtas.ClearInstances();
             rtas.CullInstances(ref cullingConfig);
         }
-        
+
+        try
+        {
         foreach (Camera camera in cameras)
         {
             var additionalData = camera.GetComponent<AdditionalCameraData>();
@@ -126,14 +128,14 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
 
             Light pointLight = null;
 
-            Object[] lights = Object.FindObjectsOfType(typeof(Light));
+            UnityEngine.Object[] lights = UnityEngine.Object.FindObjectsByType<Light>(FindObjectsSortMode.None);
 
-            foreach (Object l in lights)
+            foreach (UnityEngine.Object l in lights)
             {
                 Light light = (Light)l;
-                if (light != null) 
+                if (light != null)
                 {
-                    if (light.type == LightType.Point) 
+                    if (light.type == LightType.Point)
                     {
                         pointLight = light;
                         break;
@@ -141,7 +143,7 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
                 }
             }
 
-            if (pointLight == null)             
+            if (pointLight == null)
             {
                 return;
             }
@@ -158,52 +160,71 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
                 {
                     scriptableRenderContext = context,
                     commandBuffer = commandBuffer,
-                    currentFrameIndex = additionalData.frameIndex
+                    currentFrameIndex = additionalData.frameIndex,
+                    executionId = camera.GetEntityId(),
+                    generateDebugData = true
                 };
 
                 RTHandle outputRTHandle = rtHandleSystem.Alloc(additionalData.rayTracingOutput, "g_Output");
 
-                using (renderGraph.RecordAndExecute(renderGraphParams))
+                renderGraph.BeginRecording(renderGraphParams);
                 {
-                    using (var builder = renderGraph.AddRenderPass<RayTracingRenderPassData>("My RayTracing Pass", out var passData))
+                    using (var builder = renderGraph.AddUnsafePass<RayTracingRenderPassData>("My RayTracing Pass", out var passData))
                     {
-                        TextureHandle output = renderGraph.ImportTexture(outputRTHandle);
+                        RenderTargetInfo renderTagetInfo = new RenderTargetInfo()
+                        {
+                            width = additionalData.rayTracingOutput.width,
+                            height = additionalData.rayTracingOutput.height,
+                            bindMS = false,
+                            format = additionalData.rayTracingOutput.graphicsFormat,
+                            msaaSamples = 1,
+                            volumeDepth = 1
+                        };
 
-                        passData.outputTexture = builder.WriteTexture(output);
+                        TextureHandle output = renderGraph.ImportTexture(outputRTHandle, renderTagetInfo);
+
+                        passData.outputTexture = output;
+
+                        builder.UseTexture(passData.outputTexture, AccessFlags.Write);
+                        builder.AllowPassCulling(false);
 
                         builder.SetRenderFunc(
-                            (RayTracingRenderPassData data, RenderGraphContext ctx) =>
+                            (RayTracingRenderPassData data, UnsafeGraphContext ctx) =>
                             {
+                                CommandBuffer cmd = CommandBufferHelpers.GetNativeCommandBuffer(ctx.cmd);
+
                                 if (buildRTASForCamera)
                                 {
                                     // Build the RTAS only for one camera.
                                     buildRTASForCamera = false;
 
-                                    ctx.cmd.BuildRayTracingAccelerationStructure(rtas);
+                                    cmd.BuildRayTracingAccelerationStructure(rtas);
                                 }
 
-                                ctx.cmd.SetRayTracingShaderPass(renderPipelineAsset.rayTracingShader, "Test");
+                                cmd.SetRayTracingShaderPass(renderPipelineAsset.rayTracingShader, "Test");
 
                                 // Input
-                                ctx.cmd.SetGlobalVector(Shader.PropertyToID("PointLightPosition"), pointLight.transform.position);
-                                ctx.cmd.SetGlobalVector(Shader.PropertyToID("PointLightColor"), pointLight.color);
-                                ctx.cmd.SetGlobalFloat(Shader.PropertyToID("PointLightRange"), pointLight.range);
-                                ctx.cmd.SetGlobalFloat(Shader.PropertyToID("PointLightIntensity"), pointLight.intensity);
-                                ctx.cmd.SetRayTracingAccelerationStructure(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_SceneAccelStruct"), rtas);
+                                cmd.SetGlobalVector(Shader.PropertyToID("PointLightPosition"), pointLight.transform.position);
+                                cmd.SetGlobalVector(Shader.PropertyToID("PointLightColor"), pointLight.color);
+                                cmd.SetGlobalFloat(Shader.PropertyToID("PointLightRange"), pointLight.range);
+                                cmd.SetGlobalFloat(Shader.PropertyToID("PointLightIntensity"), pointLight.intensity);
+                                cmd.SetRayTracingAccelerationStructure(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_SceneAccelStruct"), rtas);
 
-                                ctx.cmd.SetRayTracingMatrixParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_InvViewMatrix"), camera.cameraToWorldMatrix);                                
-                                ctx.cmd.SetRayTracingFloatParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_Zoom"), Mathf.Tan(Mathf.Deg2Rad * camera.fieldOfView * 0.5f));
-                                ctx.cmd.SetRayTracingFloatParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_AspectRatio"), camera.pixelWidth / (float)camera.pixelHeight);
-                                ctx.cmd.SetRayTracingTextureParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_EnvTex"), renderPipelineAsset.envTexture);
+                                cmd.SetRayTracingMatrixParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_InvViewMatrix"), camera.cameraToWorldMatrix);
+                                cmd.SetRayTracingFloatParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_Zoom"), Mathf.Tan(Mathf.Deg2Rad * camera.fieldOfView * 0.5f));
+                                cmd.SetRayTracingFloatParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_AspectRatio"), camera.pixelWidth / (float)camera.pixelHeight);
+                                cmd.SetRayTracingTextureParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_EnvTex"), renderPipelineAsset.envTexture);
 
                                 // Output
-                                ctx.cmd.SetRayTracingTextureParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_Output"), passData.outputTexture);
+                                cmd.SetRayTracingTextureParam(renderPipelineAsset.rayTracingShader, Shader.PropertyToID("g_Output"), passData.outputTexture);
 
-                                ctx.cmd.DispatchRays(renderPipelineAsset.rayTracingShader, "MainRayGenShader", (uint)camera.pixelWidth, (uint)camera.pixelHeight, 1, camera);
+                                cmd.DispatchRays(renderPipelineAsset.rayTracingShader, "MainRayGenShader", (uint)camera.pixelWidth, (uint)camera.pixelHeight, 1, camera);
                             }
                             );
                     }
                 }
+
+                renderGraph.EndRecordingAndExecute();
 
                 commandBuffer.Blit(additionalData.rayTracingOutput, camera.activeTexture);
 
@@ -211,7 +232,41 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
             }
             else if (camera.cameraType == CameraType.Preview)
             {
-                commandBuffer.ClearRenderTarget(false, true, Color.magenta);
+                context.SetupCameraProperties(camera);
+
+                if (camera.TryGetCullingParameters(out var cullingParameters))
+                {
+                    var cullingResults = context.Cull(ref cullingParameters);
+
+                    bool clearDepth = camera.clearFlags != CameraClearFlags.Nothing;
+                    bool clearColor = camera.clearFlags == CameraClearFlags.SolidColor;
+                    commandBuffer.ClearRenderTarget(clearDepth, clearColor, camera.backgroundColor.linear);
+
+                    var shaderTagIds = new ShaderTagId[]
+                    {
+                        new ShaderTagId("SRPDefaultUnlit"),
+                        new ShaderTagId("ForwardBase"),
+                    };
+
+                    var opaqueDesc = new RendererListDesc(shaderTagIds, cullingResults, camera)
+                    {
+                        sortingCriteria = SortingCriteria.CommonOpaque,
+                        renderQueueRange = RenderQueueRange.opaque,
+                    };
+                    commandBuffer.DrawRendererList(context.CreateRendererList(opaqueDesc));
+
+                    if (camera.clearFlags == CameraClearFlags.Skybox && RenderSettings.skybox != null)
+                    {
+                        commandBuffer.DrawRendererList(context.CreateSkyboxRendererList(camera));
+                    }
+
+                    var transparentDesc = new RendererListDesc(shaderTagIds, cullingResults, camera)
+                    {
+                        sortingCriteria = SortingCriteria.CommonTransparent,
+                        renderQueueRange = RenderQueueRange.transparent,
+                    };
+                    commandBuffer.DrawRendererList(context.CreateRendererList(transparentDesc));
+                }
             }
 
             context.ExecuteCommandBuffer(commandBuffer);
@@ -220,9 +275,17 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
 
             context.Submit();
 
-            renderGraph.EndFrame();
-
             additionalData.UpdateCameraDataPostRender(camera);
-        }        
+        }
+        }
+        catch (Exception e)
+        {
+            if (renderGraph.ResetGraphAndLogException(e))
+            {
+                throw;
+            }
+        }
+
+        renderGraph.EndFrame();
     }
 }

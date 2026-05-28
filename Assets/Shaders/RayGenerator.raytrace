@@ -1,5 +1,4 @@
-﻿#include "HLSLSupport.cginc"
-#include "UnityShaderVariables.cginc"
+﻿#include "UnityShaderVariables.cginc"
 #include "Light.hlsl"
 #include "RayPayload.hlsl"
 #include "Globals.hlsl"
@@ -34,7 +33,7 @@ void MainMissShader2_Shadow(inout RayPayloadShadow payload : SV_RayPayload)
 
 [shader("raygeneration")]
 void MainRayGenShader()
-{ 
+{
 	uint2 LaunchIndex = DispatchRaysIndex().xy;
     uint2 LaunchDim = DispatchRaysDimensions().xy;
 
@@ -53,7 +52,7 @@ void MainRayGenShader()
     for (uint i = 0; i < subSampleCount; i++)
     {
         float2 ndcCoords = (frameCoord + subSamplePos[i]) / float2(LaunchDim.x - 1, LaunchDim.y - 1) ;
-        
+
         ndcCoords = ndcCoords * 2 - float2(1, 1);
         ndcCoords = ndcCoords * g_Zoom;
 
@@ -67,16 +66,16 @@ void MainRayGenShader()
         ray.Direction = rayDirection;
         ray.TMin = 0;
         ray.TMax = 1e10f;
-        
-        RayPayload payload;        
+
+        RayPayload payload;
         payload.color = float4(0, 0, 0, 0);
         payload.worldPos = float4(0, 0, 0, 1);
 	    payload.bounceIndex = 0;
-    
+
         TraceRay(g_SceneAccelStruct, 0, 0xFF, 0, 1, 0, ray, payload);
 
         float4 color = float4(payload.color.xyz, 1);
-    
+
         // Shadow ray
         float3 vecToLight = PointLightPosition - payload.worldPos.xyz;
         float vecToLightLength = length(PointLightPosition - payload.worldPos.xyz);
@@ -87,17 +86,17 @@ void MainRayGenShader()
         shadowRay.Direction = vecToLightNorm;
         shadowRay.TMin = 0;
         shadowRay.TMax = vecToLightLength;
-        
+
         RayPayloadShadow payloadShadow;
         payloadShadow.shadowValue = 0.5f;
-    
+
         const uint missShaderForShadowRay = 1;
         TraceRay(g_SceneAccelStruct, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_CULL_BACK_FACING_TRIANGLES, 0xFF, 0, 1, missShaderForShadowRay, shadowRay, payloadShadow);
 
         if (payload.worldPos.w == 1)
             color *= payloadShadow.shadowValue;
 
-        finalColor += color;
+        finalColor += color.xyz;
     }
 
 	g_Output[frameCoord] = float4(finalColor / (float)subSampleCount, 1);
