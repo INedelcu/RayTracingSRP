@@ -128,7 +128,7 @@ public class RayTracingRenderPipelineInstance : RenderPipeline
 
             Light pointLight = null;
 
-            UnityEngine.Object[] lights = UnityEngine.Object.FindObjectsByType<Light>(FindObjectsSortMode.None);
+            UnityEngine.Light[] lights = UnityEngine.Object.FindObjectsByType<Light>(FindObjectsInactive.Exclude);
 
             foreach (UnityEngine.Object l in lights)
             {
